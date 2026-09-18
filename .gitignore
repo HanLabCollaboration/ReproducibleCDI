@@ -1,0 +1,32 @@
+.Rproj.user
+.Rhistory
+.Rapp.history
+.Rdata
+.httr-oauth
+.vscode
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+inst/doc
+
+# Claude project instructions
+CLAUDE.md
+
+# local validation / scratch
+check_report/
+
+# folder with supplementary materials
+qxae161_supplementary_data/
+
+#
+dev/
+# journal supplementary materials (not redistributed)
+qxae161_supplementary_data/
+
+# generated artifacts / cached data
+README.html
+dev/*.rds

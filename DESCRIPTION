@@ -1,0 +1,39 @@
+Package: ReproducibleCDI
+Title: Reproducing the Community Deprivation Index of Neighborhood Socioeconomic Status
+Version: 0.0.0.9000
+Authors@R: c(
+    person("Rafael", "Catoia Pulgrossi", email = "rcatoiap@stanford.edu", role = c("aut", "cre")),
+    person("Tae Yoon", "Lee", email = "harrytyl@stanford.edu", role = c("aut")))
+Description: Provides a simple, tidy interface for calculating the Community
+    Deprivation Index (CDI), a composite measure of neighborhood-level
+    socioeconomic deprivation, using data from the US Census Bureau's American
+    Community Survey (ACS). The CDI follows the Singh/Area Deprivation Index
+    (ADI) methodology - a principal-component-weighted composite of 18
+    standardized ACS variables computed natively at the census block group
+    level - and adds a percentage-uninsured variable. Features include
+    automatic data fetching, flexible geographies (county, tract, block group),
+    principal component analysis, hierarchical (block group -> tract -> county)
+    imputation, and rescaling to a 1-100 percentile ranking.
+License: MIT + file LICENSE.md
+Encoding: UTF-8
+URL: https://github.com/HanLabCollaboration/ReproducibleCDI
+BugReports: https://github.com/HanLabCollaboration/ReproducibleCDI/issues
+RoxygenNote: 7.3.2
+Imports:
+    dplyr,
+    tidycensus,
+    glue,
+    purrr,
+    magrittr,
+    sf,
+    spdep,
+    psych,
+    tidyr,
+    stringr,
+    rlang,
+    stats
+Suggests:
+    knitr,
+    rmarkdown
+Depends:
+    R (>= 4.1.0)

@@ -1,0 +1,199 @@
+
+<!-- badges: start -->
+
+[![Codecov test
+coverage](https://codecov.io/gh/HanLabCollaboration/ReproducibleCDI/graph/badge.svg)](https://app.codecov.io/gh/HanLabCollaboration/ReproducibleCDI)
+<!-- badges: end -->
+
+# ReproducibleCDI
+
+[![Lifecycle:
+experimental](https://img.shields.io/badge/lifecycle-experimental-orange.svg)](https://lifecycle.r-lib.org/articles/stages.html#experimental)
+[![License:
+MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+The goal of `ReproducibleCDI` is to provide a simple, tidy interface for
+calculating the **Community Deprivation Index (CDI)**, a composite
+measure of neighborhood-level socioeconomic deprivation, using data from
+the US Census Bureau’s American Community Survey (ACS).
+
+## What is the Community Deprivation Index?
+
+The Community Deprivation Index (Robst et al., 2024) follows the Singh /
+Area Deprivation Index (ADI) methodology and updates it: it re-estimates
+the factor weights on recent ACS data, modernizes several inputs (e.g.,
+household internet in place of telephone service), and **adds a
+percentage-uninsured variable**, for a total of **18 standardized
+variables**. The CDI is designed to be computed natively at the **census
+block group** level.
+
+This package automatically fetches the required ACS data and computes
+the index across flexible geographies (county, tract, block group). The
+18 variable definitions follow the official CMS reference implementation
+([CMSgov/community-deprivation-index](https://github.com/CMSgov/community-deprivation-index),
+SAS). Every component is drawn from a detailed (`B`/`C`) ACS table so
+that block-group tabulation is available — including health insurance,
+which uses **B27010** (tabulated at the block-group level) rather than
+B27001 (which stops at the tract).
+
+The 18 component variables are:
+
+- **`educ_12less_perc`** — population aged 25+ with less than 12 years
+  of schooling (no diploma)
+- **`educ_ba_pl_perc`** — population aged 25+ with a bachelor’s degree
+  or higher
+- **`emp_white_col_perc`** — civilian employed 16+ in white-collar
+  occupations (management/business/science/arts plus sales & office)
+- **`fam_bel_pov_perc`** — families with income below the poverty line
+- **`hhld_1pl_room_perc`** — occupied units with more than one occupant
+  per room (crowding)
+- **`hhld_no_int_perc`** — households with no internet access
+- **`hhld_no_veh_perc`** — households with no vehicle available
+- **`hous_no_plumb_perc`** — housing units lacking complete plumbing
+- **`inc_dis_upd_imp`** — income disparity: natural log of 100 ×
+  (households under \$20k) / (households over \$100k)
+- **`med_gross_rent_imp`** — median gross rent
+- **`med_hhld_inc_imp`** — median household income
+- **`med_home_val_imp`** — median home value
+- **`med_month_mort_imp`** — median monthly owner cost with a mortgage
+- **`no_ins_perc`** — population with no health insurance coverage
+- **`one_par_hhld_perc_imp`** — single-parent family households with own
+  children under 18
+- **`own_occ_hous_perc`** — owner-occupied housing units
+- **`pop_bel_150_pov_perc`** — population below 150% of the poverty line
+- **`unemp_perc`** — unemployed share of the civilian labor force 16+
+
+Higher CDI scores indicate greater deprivation.
+
+## Methodology
+
+For each geography, `calculateCDIVars()` derives the 18 component
+variables from the raw ACS estimates. `processCDIScope()` then follows
+the Singh/ADI approach described in the CDI supplement:
+
+1.  **Standardize** each of the 18 variables to mean 0 and standard
+    deviation 1.
+2.  Run a **principal component analysis** (`psych::principal`) and take
+    the first component’s loadings as the factor weights $W_j$.
+3.  Form the **factor-weighted composite** $S_i = \sum_j X'_{ij} W_j$,
+    sign-aligned so that higher scores mean more deprivation
+    (`% families below poverty` loads positive).
+4.  **Rescale** the composite to mean 100, standard deviation 20
+    (`CDI_std`).
+5.  **Rank** the rescaled score into national percentiles 1–100
+    (`our_CDI`).
+
+The `scope` argument controls the reference population the PCA is fit
+over:
+
+- **`scope = "national"`** (default) — one PCA over all selected
+  geographies, ranked against each other.
+- **`scope = "state"`** — the PCA is fit separately within each state.
+
+### Missing data
+
+By default, `ReproducibleCDI` fits the PCA on **complete cases only**. A
+geography missing one or more of the 18 components (or with zero
+population) is dropped before the analysis and flagged in the
+`annotation` column.
+
+If `impute = TRUE`, the package uses the same spatial imputation as
+`ReproducibleNDI` / `ReproducibleYostIndex` (`imputeMissing()`): missing
+components are filled from contiguous (queen) neighbors before the PCA,
+so those geographies rejoin the complete-case set. The neighbor average
+is population-weighted by default (`weight_var = "tot_pop"`); set
+`weight_var = "none"` for an unweighted mean.
+
+### Differences from the CMS reference implementation
+
+The 18 **variable definitions** match the CMS SAS code. The index
+construction (principal component, standardize, rescale to 100/20, rank
+1–100) is equivalent. This package intentionally differs from CMS in
+three respects:
+
+- **Imputation** — this package uses spatial (queen-contiguity) neighbor
+  imputation, consistent with `ReproducibleNDI` /
+  `ReproducibleYostIndex`; CMS uses a hierarchical block group → tract →
+  county → state fallback.
+- **Shrinkage** — CMS applies an MOE-based empirical-Bayes shrinkage of
+  block-group values toward their tract before the PCA (this package
+  computes the “standardized index without shrinkage”).
+- **Suppression** — CMS suppresses low-population / group-quarters block
+  groups (labelling them `GQ`/`PH`); this package does not.
+
+### Geography and year availability
+
+- Requires ACS 5-year data, `year >= 2016` (the household-internet table
+  B28002 is not published earlier).
+- The CDI is conventionally a **block-group** index, but `county` and
+  `tract` are also supported.
+- The 18-variable PCA needs more complete geographies than variables;
+  very small selections (e.g., a handful of counties) will not support
+  the analysis and are flagged `"PCA failed"`.
+
+## Usage
+
+``` r
+library(ReproducibleCDI)
+
+# Requires a Census API key:
+# tidycensus::census_api_key("YOUR_KEY_HERE", install = TRUE)
+
+# CDI for Delaware block groups (2022 ACS5), with spatial imputation
+cdi_de <- computeCDI(
+  geo    = "block group",
+  year   = 2022,
+  states = "DE",
+  impute = TRUE,
+  scope  = "national"
+)
+
+head(cdi_de$df_cdi)   # GEOID, the 18 components, CDI, CDI_std, our_CDI, annotation
+```
+
+Key options (mirroring `ReproducibleNDI` and `ReproducibleYostIndex`):
+
+- **`geo`**: `"county"`, `"tract"`, or `"block group"` (`"cbg"`).
+- **`states`**: a vector of state abbreviations (e.g. `c("CA", "NY")`),
+  or `"all"` for the entire US.
+- **`scope`**: `"national"` (one PCA over all geographies) or `"state"`
+  (fit separately within each state).
+- **`impute`**: `FALSE` (default) or `TRUE` for queen-contiguity spatial
+  imputation of missing components, with `weight_var` (`"tot_pop"`
+  default, or `"none"`) controlling the neighbor average.
+- **`return_format`**: `"detailed"` (default; list of data frames + the
+  `psych::principal` object) or `"minimal"` (a single data frame with
+  `GEOID`, `CDI_std`, `our_CDI`, and `annotation`).
+
+## References
+
+1.  Robst J, Forlines G, Kautter J, et al. The development of the
+    Community Deprivation Index and its application to Accountable Care
+    Organizations. *Health Affairs Scholar.* 2024.
+    [doi:10.1093/haschl/qxae161](https://doi.org/10.1093/haschl/qxae161)
+    ([PubMed](https://pubmed.ncbi.nlm.nih.gov/39664484/))
+2.  Singh GK. Area deprivation and widening inequalities in US
+    mortality, 1969–1998. *American Journal of Public Health.*
+    2003;93(7):1137-1143.
+    [doi:10.2105/ajph.93.7.1137](https://doi.org/10.2105/ajph.93.7.1137)
+3.  Kind AJH, Buckingham WR. Making Neighborhood-Disadvantage Metrics
+    Accessible — The Neighborhood Atlas. *New England Journal of
+    Medicine.* 2018;378(26):2456-2458.
+    [doi:10.1056/NEJMp1802313](https://doi.org/10.1056/NEJMp1802313)
+
+See also the Massachusetts Health Data Tool [Community Deprivation
+Index](https://healthdatatool.mass.gov/ss_whatsnewitem/community-deprivation-index/).
+
+## Status
+
+This package is in early development.
+
+## Installation
+
+You can install the development version of `ReproducibleCDI` from
+[GitHub](https://github.com/) with:
+
+``` r
+# install.packages("pak")
+pak::pak("HanLabCollaboration/ReproducibleCDI")
+```
