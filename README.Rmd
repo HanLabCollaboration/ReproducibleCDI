@@ -26,11 +26,11 @@ The goal of `ReproducibleCDI` is to provide a simple, tidy interface for calcula
 
 ## What is the Community Deprivation Index?
 
-The Community Deprivation Index (Robst et al., 2024) follows the Singh / Area Deprivation Index (ADI) methodology and updates it: it re-estimates the factor weights on recent ACS data, modernizes several inputs (e.g., household internet in place of telephone service), and **adds a percentage-uninsured variable**, for a total of **18 standardized variables**. The CDI is designed to be computed natively at the **census block group** level.
+The Community Deprivation Index (Robst et al., 2024) follows the Singh / Area Deprivation Index (ADI) methodology and updates it: it re-estimates the factor weights on recent ACS data, modernizes several inputs (e.g., household internet in place of telephone service), and **adds a percentage-uninsured variable**, for a total of **18 standardized variables**. It is designed as a **census block group** index.
 
-This package automatically fetches the required ACS data and computes the index across flexible geographies (county, tract, block group). The 18 variable definitions follow the official CMS reference implementation ([CMSgov/community-deprivation-index](https://github.com/CMSgov/community-deprivation-index), SAS). Every component is drawn from a detailed (`B`/`C`) ACS table so that block-group tabulation is available — including health insurance, which uses **B27010** (tabulated at the block-group level) rather than B27001 (which stops at the tract).
+The variables in this package are **exactly** those of the official CMS reference implementation ([CMSgov/community-deprivation-index](https://github.com/CMSgov/community-deprivation-index), SAS): same ACS cells, same formulas. No other table is ever substituted; if a CMS table is not published at a geography for a given year, the package stops and says so.
 
-The 18 component variables are:
+The 18 component variables (CMS names, lowercase) are:
 
 * **`educ_12less_perc`** — population aged 25+ with less than 12 years of schooling (no diploma)
 * **`educ_ba_pl_perc`** — population aged 25+ with a bachelor's degree or higher
@@ -40,53 +40,60 @@ The 18 component variables are:
 * **`hhld_no_int_perc`** — households with no internet access
 * **`hhld_no_veh_perc`** — households with no vehicle available
 * **`hous_no_plumb_perc`** — housing units lacking complete plumbing
-* **`inc_dis_upd_imp`** — income disparity: natural log of 100 × (households under \$20k) / (households over \$100k)
-* **`med_gross_rent_imp`** — median gross rent
-* **`med_hhld_inc_imp`** — median household income
-* **`med_home_val_imp`** — median home value
-* **`med_month_mort_imp`** — median monthly owner cost with a mortgage
+* **`inc_dis_upd`** — income disparity: natural log of 100 × (households under \$20k) / (households over \$100k)
+* **`med_gross_rent`** — median gross rent
+* **`med_hhld_inc`** — median household income
+* **`med_home_val`** — median home value
+* **`med_month_mort`** — median monthly owner cost with a mortgage
 * **`no_ins_perc`** — population with no health insurance coverage
-* **`one_par_hhld_perc_imp`** — single-parent family households with own children under 18
+* **`one_par_hhld_perc`** — single-parent family households with own children under 18
 * **`own_occ_hous_perc`** — owner-occupied housing units
 * **`pop_bel_150_pov_perc`** — population below 150% of the poverty line
 * **`unemp_perc`** — unemployed share of the civilian labor force 16+
 
+CMS also computes **`educ_hs_pl_perc`** (high-school diploma or more) but does not use it in the index; the package returns it for completeness. Values are used exactly as `tidycensus` returns them (Census jam codes are already missing; top-coded medians such as \$250,001 stay numeric).
+
 Higher CDI scores indicate greater deprivation.
 
-## Methodology
+## Two ways to compute the CDI
 
-For each geography, `calculateCDIVars()` derives the 18 component variables from the raw ACS estimates. `processCDIScope()` then follows the Singh/ADI approach described in the CDI supplement:
+| | `computeOriginalCDI()` | `computeCDI()` |
+|---|---|---|
+| Purpose | Reproduce **every** CMS step | CDI built the ReproducibleX way |
+| Geography | block group | county, tract, block group |
+| Years (ACS5) | 2017–2022 | 2017 and later |
+| Rate with a zero denominator | 0 (CMS) | missing (as in the sibling packages) |
+| Stabilization | CMS shrinkage toward the tract | optional (`stabilize = TRUE`), same function |
+| Imputation | hierarchical: tract → county → state | optional spatial queen-contiguity (`impute = TRUE`) |
+| Order of the two | stabilize, then impute | your choice: `order = "stabilize_first"` or `"impute_first"` |
+| Suppression | `GQ` / `PH` / `GQ-PH` block groups | only zero-population geographies dropped |
+| Ranking | SAS `proc rank groups=100` | `dplyr::ntile(…, 100)` |
 
-1. **Standardize** each of the 18 variables to mean 0 and standard deviation 1.
-2. Run a **principal component analysis** (`psych::principal`) and take the first component's loadings as the factor weights \(W_j\).
-3. Form the **factor-weighted composite** \(S_i = \sum_j X'_{ij} W_j\), sign-aligned so that higher scores mean more deprivation (`% families below poverty` loads positive).
-4. **Rescale** the composite to mean 100, standard deviation 20 (`CDI_std`).
-5. **Rank** the rescaled score into national percentiles 1–100 (`our_CDI`).
+### `computeOriginalCDI()`: the CMS method, step by step
 
-The `scope` argument controls the reference population the PCA is fit over:
+1. Fetch ACS5 data at block group (with margins of error), tract, county, and state. Every variable is computed at each level from that level's own tables.
+2. Compute the 19 CMS variables; block-group margins of error follow the CMS formulas.
+3. Flag block groups for suppression: `PH` (population < 100 or housing units < 30), `GQ` (≥ 1/3 of residents in group quarters), or `GQ-PH`.
+4. **Stabilize** each block-group value toward its tract with the CMS empirical Bayes shrinkage (`stabilizeCDI()`): \(w = \frac{1/s^2}{1/s^2 + 1/t^2}\), where \(s^2 = (MOE/1.645)^2\) and \(t^2\) is the spread of the tract's block groups around the tract value.
+5. **Impute** remaining gaps hierarchically from the tract, county, then state value, and take the log of the income-disparity ratio.
+6. Standardize, fit a one-component PCA on the non-suppressed block groups, score with the scoring coefficients, rescale to mean 100 / SD 20.
+7. Rank into 1–100 exactly as SAS `proc rank groups=100`; suppressed block groups get their flag instead of a rank (`CDI_NATRANK`).
 
-* **`scope = "national"`** (default) — one PCA over all selected geographies, ranked against each other.
-* **`scope = "state"`** — the PCA is fit separately within each state.
+The national ranking (`states = "all"`) includes the 50 states, DC, and Puerto Rico, as in the CMS file. Only ACS5 2017–2022 are supported: the household-internet table (B28002) starts in 2017, and the group-quarters table (B09019) needed for `GQ` suppression is not published at block group from ACS5 2023 on. Asking for a later year is an error.
 
-### Missing data
+### `computeCDI()`: ReproducibleX conventions, with your choice of order
 
-By default, `ReproducibleCDI` fits the PCA on **complete cases only**. A geography missing one or more of the 18 components (or with zero population) is dropped before the analysis and flagged in the `annotation` column.
+`computeCDI()` uses the same 18 variables, sets a rate with a zero denominator to missing, drops zero-population geographies, and fits the PCA on complete cases, as `ReproducibleYostIndex`, `ReproducibleNDI`, and `ReproducibleSDI` do. Two optional steps:
 
-If `impute = TRUE`, the package uses the same spatial imputation as `ReproducibleNDI` / `ReproducibleYostIndex` (`imputeMissing()`): missing components are filled from contiguous (queen) neighbors before the PCA, so those geographies rejoin the complete-case set. The neighbor average is population-weighted by default (`weight_var = "tot_pop"`); set `weight_var = "none"` for an unweighted mean.
+* **`stabilize = TRUE`** — the CMS shrinkage (`stabilizeCDI()`, the same function `computeOriginalCDI()` uses) toward the parent level: block group → tract (as CMS), tract → county, or county → state (as in `ReproducibleYostIndex`). Only observed values with a margin of error are stabilized.
+* **`impute = TRUE`** — spatial queen-contiguity imputation (`imputeMissing()`), population-weighted by default (`weight_var = "tot_pop"`, or `"none"`).
 
-### Differences from the CMS reference implementation
+When both are on, **`order`** chooses the sequence:
 
-The 18 **variable definitions** match the CMS SAS code. The index construction (principal component, standardize, rescale to 100/20, rank 1–100) is equivalent. This package intentionally differs from CMS in three respects:
+* **`"stabilize_first"`** (default) — stabilize the observed values, then impute the remaining gaps from the stabilized neighbors (the same order as `computeYostIndex()`).
+* **`"impute_first"`** — impute from the raw neighbors, then stabilize. Imputed cells have no margin of error, so they are not stabilized themselves, but they count in the tract spread \(t^2\) used to stabilize their observed neighbors.
 
-* **Imputation** — this package uses spatial (queen-contiguity) neighbor imputation, consistent with `ReproducibleNDI` / `ReproducibleYostIndex`; CMS uses a hierarchical block group → tract → county → state fallback.
-* **Shrinkage** — CMS applies an MOE-based empirical-Bayes shrinkage of block-group values toward their tract before the PCA (this package computes the "standardized index without shrinkage").
-* **Suppression** — CMS suppresses low-population / group-quarters block groups (labelling them `GQ`/`PH`); this package does not.
-
-### Geography and year availability
-
-* Requires ACS 5-year data, `year >= 2016` (the household-internet table B28002 is not published earlier).
-* The CDI is conventionally a **block-group** index, but `county` and `tract` are also supported.
-* The 18-variable PCA needs more complete geographies than variables; very small selections (e.g., a handful of counties) will not support the analysis and are flagged `"PCA failed"`.
+The PCA, scoring, and rescaling are as above; `our_CDI` ranks into percentiles 1–100. The `scope` argument controls the reference population: `"national"` (default, one PCA) or `"state"` (one PCA per state).
 
 ## Usage
 
@@ -96,25 +103,33 @@ library(ReproducibleCDI)
 # Requires a Census API key:
 # tidycensus::census_api_key("YOUR_KEY_HERE", install = TRUE)
 
-# CDI for Delaware block groups (2022 ACS5), with spatial imputation
+# The CMS index, reproduced exactly (2019 block groups, national)
+cdi_cms <- computeOriginalCDI(year = 2019, states = "all")
+head(cdi_cms$df_cdi)   # ..., CDI_std, cdi_rank, CDI_NATRANK, annotation
+
+# ReproducibleX-style CDI for Delaware block groups (2022 ACS5),
+# stabilized toward the tract, then spatially imputed
 cdi_de <- computeCDI(
-  geo    = "block group",
-  year   = 2022,
-  states = "DE",
-  impute = TRUE,
-  scope  = "national"
+  geo       = "block group",
+  year      = 2022,
+  states    = "DE",
+  stabilize = TRUE,
+  impute    = TRUE,
+  order     = "stabilize_first"
 )
 
-head(cdi_de$df_cdi)   # GEOID, the 18 components, CDI, CDI_std, our_CDI, annotation
+head(cdi_de$df_cdi)   # GEOID, the components, CDI, CDI_std, our_CDI, annotation
 ```
 
-Key options (mirroring `ReproducibleNDI` and `ReproducibleYostIndex`):
+Key `computeCDI()` options (mirroring `ReproducibleNDI` and `ReproducibleYostIndex`):
 
 * **`geo`**: `"county"`, `"tract"`, or `"block group"` (`"cbg"`).
 * **`states`**: a vector of state abbreviations (e.g. `c("CA", "NY")`), or `"all"` for the entire US.
-* **`scope`**: `"national"` (one PCA over all geographies) or `"state"` (fit separately within each state).
-* **`impute`**: `FALSE` (default) or `TRUE` for queen-contiguity spatial imputation of missing components, with `weight_var` (`"tot_pop"` default, or `"none"`) controlling the neighbor average.
-* **`return_format`**: `"detailed"` (default; list of data frames + the `psych::principal` object) or `"minimal"` (a single data frame with `GEOID`, `CDI_std`, `our_CDI`, and `annotation`).
+* **`stabilize`**, **`impute`**, **`order`**: see above.
+* **`scope`**: `"national"` or `"state"`.
+* **`return_format`**: `"detailed"` (default; a list with the data, the stabilization diagnostics, and the `psych::principal` object) or `"minimal"` (`GEOID`, `CDI_std`, `our_CDI`, `annotation`).
+
+The 18-variable PCA needs more complete geographies than variables; very small selections (e.g., a handful of counties) are flagged `"PCA failed"`.
 
 ## References
 

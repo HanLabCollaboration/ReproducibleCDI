@@ -8,7 +8,9 @@ computeCDI(
   geo,
   year,
   states,
+  stabilize = FALSE,
   impute = FALSE,
+  order = c("stabilize_first", "impute_first"),
   quiet = FALSE,
   return_format = "detailed",
   scope = "national",
@@ -20,14 +22,27 @@ computeCDI(
 \item{geo}{The geography level. One of `"county"`, `"tract"`,
 `"block group"` (or `"cbg"`). The CDI is conventionally a block-group index.}
 
-\item{year}{The 5-year ACS survey end year (e.g., 2022). Must be >= 2016
-because the household-internet variable (B28002) is not published earlier.}
+\item{year}{The 5-year ACS survey end year (e.g., 2022). Must be >= 2017
+because the household-internet table B28002 is not published earlier.}
 
 \item{states}{A vector of state abbreviations (e.g., `c("CA", "NY")`) or
 `"all"` for the entire US.}
 
+\item{stabilize}{Logical. If `TRUE`, applies the CMS MOE-based empirical
+Bayes stabilization ([stabilizeCDI()]) toward the parent level: block group
+toward tract (as CMS), tract toward county, or county toward state (as in
+ReproducibleYostIndex). Only observed values with a margin of error are
+stabilized.}
+
 \item{impute}{Logical. If `TRUE`, performs spatial (queen-contiguity) mean
-imputation for missing data, as in the sibling Yost/NDI packages.}
+imputation of missing data ([imputeMissing()]), as in the sibling packages.}
+
+\item{order}{Order of the two steps when both `stabilize` and `impute` are
+`TRUE`: `"stabilize_first"` (default) stabilizes the observed values and
+then imputes the remaining gaps from the stabilized neighbors;
+`"impute_first"` imputes from the raw neighbors and then stabilizes
+(imputed cells are not stabilized themselves, but they enter the parent
+heterogeneity used to stabilize the observed cells).}
 
 \item{quiet}{Logical. If `TRUE`, suppresses messages and warnings.}
 
@@ -47,30 +62,38 @@ each state separately.}
 If `return_format = "minimal"`, a data frame of `GEOID`, `CDI_std`,
 `our_CDI`, and `annotation`. Otherwise a list with:
 \itemize{
-  \item `df_cdi`: primary data frame with the component variables, the raw
-    composite `CDI`, the rescaled `CDI_std` (mean 100 / SD 20), the national
-    percentile `our_CDI` (1-100), and `annotation`.
-  \item `data_harmonized`: the standardized component data fed into the PCA.
-  \item `data_without_imputation`: the raw, non-imputed component data.
+  \item `df_cdi`: primary data frame with the component variables (after
+    stabilization / imputation), the raw composite `CDI`, the rescaled
+    `CDI_std` (mean 100 / SD 20), the percentile `our_CDI` (1-100),
+    `nvar_stabilized`, `nvar_imputed`, and `annotation`. With
+    `stabilize = TRUE` it also has `<var>_raw`, `<var>_raw_moe`, and
+    `stabilizedflg_<var>` (the `inc_dis_upd` MOE is on the ratio scale).
+  \item `data_harmonized`: the complete-case data fed into the PCA.
+  \item `data_without_imputation`: the raw component data.
+  \item `data_stabilized`: the [stabilizeCDI()] output with diagnostics
+    (`NULL` unless `stabilize = TRUE`).
   \item `obj_pca`: the `psych::principal` object (or a named list of objects
     when `scope = "state"`).
+  \item `settings`: the method choices used.
 }
 }
 \description{
 Fetches and processes ACS data to calculate the Community Deprivation Index
-(CDI), a composite measure of neighborhood-level socioeconomic deprivation.
+(CDI), a composite measure of neighborhood-level socioeconomic deprivation,
+following the conventions of the sibling ReproducibleX packages
+(ReproducibleYostIndex, ReproducibleNDI, ReproducibleSDI).
 
-The CDI follows the Singh / Area Deprivation Index (ADI) methodology and adds
-a percentage-uninsured variable, for a total of 18 standardized ACS
-variables. The function automates: 1) data fetching from `tidycensus`,
-2) calculation of the 18 component variables, 3) optional spatial imputation,
-4) a principal component analysis whose first-component loadings provide the
-factor weights, 5) construction of the factor-weighted composite, 6)
-rescaling to mean 100 / SD 20, and 7) ranking into national percentiles 1-100.
+The variables are exactly the 18 used by the official CMS reference
+implementation (CMSgov/community-deprivation-index). The function automates:
+1) data fetching from `tidycensus`, 2) calculation of the variables (a rate
+with a zero denominator is missing, as in the sibling packages), 3) optional
+CMS stabilization and/or spatial imputation, in the order you choose, 4) a
+one-component principal component analysis whose scoring coefficients give
+the factor-weighted composite, 5) rescaling to mean 100 / SD 20, and 6)
+ranking into percentiles 1-100.
 
-The CDI is designed to be computed natively at the **census block group**
-level; every component variable is drawn from a detailed (`B`/`C`) ACS table
-so that block-group tabulation is available.
+To reproduce every CMS step exactly (hierarchical imputation, suppression,
+SAS ranking), use [computeOriginalCDI()] instead.
 }
 \references{
 Robst, J., Forlines, G., Kautter, J., et al. (2024). The development of the

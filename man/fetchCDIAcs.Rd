@@ -4,29 +4,41 @@
 \alias{fetchCDIAcs}
 \title{Fetch raw ACS data for Community Deprivation Index (CDI) variables}
 \usage{
-fetchCDIAcs(geo, year, states, get_geometry)
+fetchCDIAcs(
+  geo,
+  year,
+  states,
+  get_geometry = FALSE,
+  moe = FALSE,
+  suppression = FALSE
+)
 }
 \arguments{
-\item{geo}{Geography level ("county", "tract", "block group"/"cbg").}
+\item{geo}{Geography level: `"state"`, `"county"`, `"tract"`, or
+`"block group"` (`"cbg"`).}
 
 \item{year}{The ACS5 end year.}
 
-\item{states}{A vector of state abbreviations or 'all'.}
+\item{states}{A vector of state abbreviations.}
 
 \item{get_geometry}{Logical, whether to download geometry.}
+
+\item{moe}{Logical. If `TRUE`, also keep the margin-of-error (`M`) columns.}
+
+\item{suppression}{Logical. If `TRUE`, also fetch the cells used for the CMS
+block-group suppression flags (see `cdiSuppressionCells()`).}
 }
 \value{
-A tidycensus data frame (wide) with an `acs_vars` attribute that
-  records the variable groupings used by `calculateCDIVars()`.
+A wide tidycensus data frame with `GEOID`, `NAME`, the `<cell>E`
+  columns (and `<cell>M` columns when `moe = TRUE`), plus geometry if
+  requested.
 }
 \description{
-Internal helper that queries the Census API for all variables required to
-compute the 18 CDI component variables. The CDI follows the Singh / Area
-Deprivation Index (ADI) methodology and is designed to be computed natively
-at the **census block group** level. For that reason every variable is drawn
-from a **detailed (`B`/`C`) table**: the Census Bureau does not tabulate the
-Subject (`S`) or Data Profile (`DP`) table families below the census-tract
-level, so those families cannot be used for a block-group index. (Health
-insurance uses B27010, which is tabulated at the block-group level, rather
-than B27001, which stops at the tract.)
+Internal helper that queries the Census API for every ACS cell needed to
+compute the CDI variables defined in `cdiVarSpec()` (the CMS reference
+definitions), plus total population (`B01001_001`). Every cell comes from a
+detailed (`B`/`C`) ACS table; the Census Bureau does not tabulate the Subject
+(`S`) or Data Profile (`DP`) families below the tract, so they are never used.
+
+Values are returned exactly as tidycensus provides them.
 }

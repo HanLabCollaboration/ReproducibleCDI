@@ -2,45 +2,58 @@
 % Please edit documentation in R/calculateCDIVars.R
 \name{calculateCDIVars}
 \alias{calculateCDIVars}
-\title{Calculate the 18 CDI component variables}
+\title{Calculate the CDI component variables}
 \usage{
-calculateCDIVars(data, acs_vars)
+calculateCDIVars(data, zero_denominator = c("zero", "na"), with_moe = FALSE)
 }
 \arguments{
-\item{data}{The cleaned data frame from `cleanAcsNamesCDI()`.}
+\item{data}{The raw (optionally name-cleaned) wide data from `fetchCDIAcs()`.}
 
-\item{acs_vars}{The `acs_vars` list attached by `fetchCDIAcs()`.}
+\item{zero_denominator}{How to treat a rate whose denominator is 0:
+`"zero"` sets it to 0 (CMS rule, used by `computeOriginalCDI()`); `"na"`
+sets it to missing (rule of the sibling ReproducibleX packages, used by
+`computeCDI()`).}
+
+\item{with_moe}{Logical. If `TRUE`, also return `<var>_moe` columns computed
+with the CMS MOE formulas. Requires the `<cell>M` columns.}
 }
 \value{
-A data frame with GEOID, geography columns, `tot_pop`, and the 18
-  component variables (plus geometry if present).
+A data frame with `GEOID`, any name / geography columns present,
+  `tot_pop`, the 19 variables, optional `_moe` columns, and geometry if
+  present.
 }
 \description{
-Internal helper that derives the 18 Community Deprivation Index component
-variables from the raw ACS estimates returned by `fetchCDIAcs()`.
-
-Direction of each variable (positive = more deprived, negative = less
-deprived) is *not* enforced here - it is learned from the data by the
-principal component analysis in `processCDIScope()`. The percentage/level
-variables kept here match the naming used in the CDI supplement:
+Internal helper that derives the CDI variables from raw ACS estimates
+returned by `fetchCDIAcs()`, following the CMS reference definitions in
+`cdiVarSpec()`:
 \itemize{
   \item `educ_12less_perc`  - pop 25+ with < 12 years schooling (no diploma)
+  \item `educ_hs_pl_perc`   - pop 25+ with a high-school diploma or more
+    (computed by CMS but **not** used in the PCA)
   \item `educ_ba_pl_perc`   - pop 25+ with a bachelor's degree or higher
-  \item `emp_white_col_perc`- civilian employed 16+ in mgmt/bus/sci/arts
+  \item `emp_white_col_perc`- civilian employed 16+ in mgmt/bus/sci/arts or
+    sales/office occupations
   \item `fam_bel_pov_perc`  - families below the poverty line
   \item `hhld_1pl_room_perc`- occupied units with > 1 person per room
   \item `hhld_no_int_perc`  - households with no internet access
   \item `hhld_no_veh_perc`  - households with no vehicle available
   \item `hous_no_plumb_perc`- units lacking complete plumbing
-  \item `inc_dis_upd_imp`   - income disparity (log ratio, updated)
-  \item `med_gross_rent_imp`- median gross rent
-  \item `med_hhld_inc_imp`  - median household income
-  \item `med_home_val_imp`  - median home value
-  \item `med_month_mort_imp`- median monthly owner cost with a mortgage
+  \item `inc_dis_upd`       - income disparity, 100 x households < $20k /
+    households > $100k, **on the ratio scale** (missing when either count is
+    0). It is log-transformed by `finalizeIncDis()` after stabilization and
+    imputation, as in the CMS code.
+  \item `med_gross_rent`    - median gross rent
+  \item `med_hhld_inc`      - median household income
+  \item `med_home_val`      - median home value
+  \item `med_month_mort`    - median monthly owner cost with a mortgage
   \item `no_ins_perc`       - population with no health insurance
-  \item `one_par_hhld_perc_imp` - single-parent family households
+  \item `one_par_hhld_perc` - single-parent family households
   \item `own_occ_hous_perc` - owner-occupied housing units
   \item `pop_bel_150_pov_perc`  - population below 150% of poverty
   \item `unemp_perc`        - unemployed share of the civilian labor force
 }
+
+Rates are proportions (0-1). Medians are used exactly as tidycensus returns
+them (Census jam codes are already `NA`; top/bottom-coded medians are numeric
+caps).
 }

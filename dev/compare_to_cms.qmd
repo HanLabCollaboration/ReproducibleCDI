@@ -1,0 +1,495 @@
+---
+title: "ReproducibleCDI vs. the official CMS index"
+author: "ReproducibleCDI"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: show
+    embed-resources: true
+    fig-width: 7
+    fig-height: 6
+execute:
+  warning: false
+  message: false
+knitr:
+  opts_chunk:
+    collapse: true
+    comment: "#>"
+---
+
+## Purpose
+
+This document has two parts:
+
+1. **Validation.** `computeOriginalCDI()` reproduces every step of the CMS
+   reference implementation. We compare its output with the index CMS
+   published (`CDI_NATRANK.csv`).
+2. **Our approach vs. the original approach.** `computeCDI()` builds the CDI the
+   way the sibling ReproducibleX packages do (zero denominators are missing,
+   spatial imputation, optional stabilization in a chosen order, no
+   suppression). We compare several `computeCDI()` configurations with
+   `computeOriginalCDI()`.
+
+- Reference: <https://github.com/CMSgov/community-deprivation-index>
+  (`CDI_NATRANK.csv` = block-group national rank 1–100 produced by the CMS SAS
+  code, or `GQ` / `PH` / `GQ-PH` for suppressed block groups; 50 states, DC,
+  and Puerto Rico).
+- Data: **2019 ACS 5-year (2015–2019)**, block groups, national.
+
+All national runs are slow, so they are precomputed and cached as `.rds` files
+by `dev/run_compare_variants.R`. This document only reads the caches.
+
+## Setup
+
+```{r}
+#| label: setup
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(ggplot2)      # geom_hex needs the {hexbin} package installed too
+library(here)
+# Package root, whether here() points at tidySDOH/, ReproducibleCDI/, or dev/
+# (dev/ has a .here file, so quarto render from dev/ makes here() = dev/).
+candidates <- c(here::here("ReproducibleCDI"), here::here(), dirname(here::here()))
+pkg_root <- candidates[file.exists(file.path(candidates, "DESCRIPTION"))][1]
+devtools::load_all(pkg_root, quiet = TRUE)   # or library(ReproducibleCDI)
+
+dev_dir <- file.path(pkg_root, "dev")
+```
+
+```{r}
+#| label: helpers
+# Rank agreement between two 1-100 rank vectors (same block groups).
+rank_agreement <- function(a, b) {
+  d <- a - b
+  tibble::tibble(
+    n            = length(a),
+    spearman     = cor(a, b, method = "spearman"),
+    exact_pct    = 100 * mean(d == 0),
+    within1_pct  = 100 * mean(abs(d) <= 1),
+    within5_pct  = 100 * mean(abs(d) <= 5),
+    mean_abs     = mean(abs(d)),
+    same_decile_pct = 100 * mean((a - 1) %/% 10 == (b - 1) %/% 10)
+  )
+}
+
+hex_plot <- function(data, x, y, xlab, ylab, title) {
+  ggplot(data, aes(x = {{ x }}, y = {{ y }})) +
+    geom_hex(binwidth = c(2, 2)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey30") +
+    scale_fill_viridis_c(trans = "log10", name = "Block groups", labels = scales::comma) +
+    coord_equal(xlim = c(1, 100), ylim = c(1, 100)) +
+    labs(title = title, x = xlab, y = ylab) +
+    theme_minimal(base_size = 12)
+}
+```
+
+# Part 1 — Validation: `computeOriginalCDI()` vs. CMS
+
+## What `computeOriginalCDI()` does, step by step
+
+A line-by-line port of `cdi_construction_s1.sas` and `cdi_construction_s2.sas`.
+It has no method options. Block groups only.
+
+0. **Year check.** ACS5 2017–2022 only, before any Census call. B28002
+   (internet) starts in 2017. From 2023 on, B09019 (group quarters) is all
+   missing at block group, so the `GQ` suppression cannot be reproduced.
+1. **Fetch.** ACS5 estimates for the 50 states, DC and Puerto Rico at four
+   levels: block group (with MOEs and the suppression cells `B01001_001`,
+   `B25032_001`, `B09019`), tract, county and state. Parent values come from
+   each level's own ACS tables, not from aggregating block groups.
+2. **Variables.** The 19 CMS variables at every level: 18 enter the PCA, and
+   `educ_hs_pl_perc` is computed but not used. A rate with a zero denominator is
+   **0**. The income-disparity ratio `inc_dis_upd` = 100 × low / high income
+   count (missing if either is 0) stays on the ratio scale until step 5.
+3. **Margins of error** (block group only):
+   - medians: the published MOE (`%moe1`);
+   - rates and the ratio: the cell MOEs are combined by root sum of squares,
+     then
+     $\text{MOE} = \sqrt{\text{MOE}_{num}^2 - p^2\,\text{MOE}_{den}^2}\,/\,den$,
+     or the additive form ($+$) when the term under the root is ≤ 0
+     (`%moe2` / `%moe3`).
+4. **Suppression flag.** Block groups whose estimates CMS considers
+   unreliable or unrepresentative:
+   - `PH` (**low population / housing**): population (`B01001_001`) < 100 or
+     housing units (`B25032_001`) < 30. A missing count also flags `PH`, as in
+     SAS.
+   - `GQ` (**group quarters**): at least one third (≥ 0.3333) of residents
+     live in group quarters (`B09019`), such as dorms, prisons, nursing homes
+     or military barracks. These residents are not in households, so the
+     household-based variables do not describe the area well.
+   - `GQ-PH`: both.
+
+   Suppressed block groups are only **flagged** here: they stay in steps 5–6
+   and leave at step 7.
+5. **Stabilization (shrinkage)** of all 19 variables, block group → tract
+   (`stabilizeCDI()`). For variable $v$, block group $i$, tract $T$:
+   - $n_T$ = all block groups in the tract, including suppressed ones and ones
+     with $v$ missing;
+   - $t^2 = \sum_i (v_i - v_T)^2 / (n_T - 1)$ (heterogeneity within the tract);
+   - $s^2 = (\text{MOE}_i / 1.645)^2$ (sampling variance);
+   - $w = \dfrac{1/s^2}{1/s^2 + 1/t^2}$, $\;v_i^* = w\,v_i + (1-w)\,v_T$.
+
+   The value is kept as-is when $v_i$, $v_T$ or the MOE is missing, when
+   $n_T = 1$, or when $s^2$ or $t^2$ is ≤ 0.
+6. **Hierarchical imputation** (`imputeHierarchical()`). A value still missing
+   takes the first available of tract → county → state. For `inc_dis_upd` a 0
+   also falls back. Then `inc_dis_upd` = log(ratio); a ratio ≤ 0 becomes
+   missing.
+7. **PCA** (`fitCDIPCA()`) on the **non-suppressed** block groups:
+   - each variable is z-standardized using all its available values
+     (`proc standard`);
+   - one principal component on the correlation matrix of complete rows
+     (`proc factor`);
+   - scoring coefficients = loadings / eigenvalue, signed so that
+     `fam_bel_pov_perc` is positive (higher = more deprived);
+   - score = Σ coefficient × z, and `CDI_std` = 100 + 20 × the standardized
+     score.
+8. **Rank** (`rankGroupsSAS()`), as SAS `proc rank groups=100` + 1:
+   $\lfloor r \cdot 100 / (n + 1) \rfloor + 1$, with mean rank for ties.
+   A non-suppressed block group with a missing score gets rank **1**, because
+   CMS writes `sum(rank, 1)` and SAS `sum()` ignores missing values. Suppressed
+   block groups get their label instead of a rank. The result is
+   `CDI_NATRANK` = `"1"`–`"100"`, `"GQ"`, `"PH"`, `"GQ-PH"`.
+
+## CMS published ranks
+
+The file in `dev/` was downloaded from the CMS GitHub repository.
+
+```{r}
+#| label: cms-reference
+
+cms <- readr::read_csv(file.path(dev_dir, "CDI_NATRANK.csv"), col_types = "cc") |>
+  dplyr::rename(GEOID = FIPS_BG, cms_label = CDI_NATRANK) |>
+  dplyr::mutate(
+    GEOID      = stringr::str_pad(GEOID, 12, pad = "0"),
+    suppressed = cms_label %in% c("GQ", "PH", "GQ-PH"),
+    cms_rank   = suppressWarnings(as.integer(cms_label))
+  )
+
+dplyr::count(cms, cms_label = ifelse(suppressed, cms_label, "ranked 1-100"))
+```
+
+## `computeOriginalCDI(2019, "all")`
+
+```{r}
+#| label: original
+original_rds <- file.path(dev_dir, "cdi_original_2019.rds")
+# Created by dev/run_compare_variants.R:
+#   computeOriginalCDI(year = 2019, states = "all")
+original <- readRDS(original_rds)
+orig <- original$df_cdi
+
+cat("Run time:", format(original$elapsed), "\n")
+dplyr::count(orig, annotation)
+```
+
+## Coverage and suppression
+
+Every CMS block group should be present, with the same suppression label.
+
+```{r}
+#| label: suppression
+val <- orig |>
+  dplyr::select(GEOID, CDI_NATRANK, cdi_rank, CDI_std, annotation) |>
+  dplyr::full_join(cms, by = "GEOID")
+
+label <- function(x) ifelse(x %in% c("GQ", "PH", "GQ-PH"), x,
+                            ifelse(is.na(x), "<absent>", "ranked"))
+table(computeOriginalCDI = label(val$CDI_NATRANK), CMS = label(val$cms_label), useNA = "ifany")
+```
+
+## Rank agreement
+
+```{r}
+#| label: validation-metrics
+val_ranked <- val |> dplyr::filter(!is.na(cdi_rank), !is.na(cms_rank))
+rank_agreement(val_ranked$cdi_rank, val_ranked$cms_rank) |>
+  knitr::kable(digits = 4)
+
+cat("Identical CDI_NATRANK label for all block groups:",
+    identical(val$CDI_NATRANK, val$cms_label), "\n")
+```
+
+```{r}
+#| label: validation-scatter
+ggplot(val_ranked, aes(x = cms_rank, y = cdi_rank)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(size = 0.6, alpha = 0.2, colour = "#1f4e79") +
+  coord_equal(xlim = c(1, 100), ylim = c(1, 100)) +
+  labs(title = "computeOriginalCDI vs. CMS published CDI (2019 ACS5)",
+       x = "CDI_NATRANK (CMS)", y = "cdi_rank (computeOriginalCDI)") +
+  theme_minimal(base_size = 12)
+```
+
+## PCA scoring coefficients
+
+The standardized scoring coefficients (loadings / eigenvalue) of the single
+principal component, fitted on the `r format(original$pca$n_obs, big.mark = ",")`
+non-suppressed block groups.
+
+```{r}
+#| label: validation-pca
+tibble::tibble(
+  variable    = names(original$pca$coefficients),
+  loading     = original$pca$loadings,
+  coefficient = original$pca$coefficients
+) |>
+  dplyr::arrange(dplyr::desc(abs(loading))) |>
+  knitr::kable(digits = 4)
+```
+
+## How much do stabilization and imputation do in the CMS method?
+
+```{r}
+#| label: validation-steps
+orig |>
+  dplyr::filter(is.na(suppression_flag)) |>
+  dplyr::summarise(
+    `ranked block groups` = dplyr::n(),
+    `mean variables stabilized (of 18)` = mean(nvar_stabilized),
+    `with >= 1 variable imputed` = sum(nvar_imputed > 0),
+    `mean variables imputed (of 18)` = mean(nvar_imputed)
+  ) |>
+  knitr::kable(digits = 2)
+
+# Where the imputed values came from, per variable (non-suppressed block groups)
+original$imp_src |>
+  dplyr::semi_join(orig |> dplyr::filter(is.na(suppression_flag)), by = "GEOID") |>
+  tidyr::pivot_longer(-GEOID, names_to = "variable", values_to = "source") |>
+  dplyr::mutate(variable = sub("_imp_src$", "", variable)) |>
+  dplyr::filter(variable != "educ_hs_pl_perc", source != "self") |>
+  dplyr::count(variable, source) |>
+  tidyr::pivot_wider(names_from = source, values_from = n, values_fill = 0) |>
+  knitr::kable()
+```
+
+# Part 2 — Our approach vs. the original approach
+
+## `computeOriginalCDI()` vs. `computeCDI()`
+
+Both use the same 18 CMS PCA variables (`cdiVarSpec()`), the same MOE formulas,
+the same stabilization function (`stabilizeCDI()`), and the same PCA and
+scoring (`fitCDIPCA()`). They differ in how they handle missing data, which
+block groups they keep, and how they rank.
+
+| Step | `computeOriginalCDI()` (CMS, exact) | `computeCDI()` (ReproducibleX) |
+|---|---|---|
+| Purpose | Reproduce the published CMS index | Same variables, built the way the sibling packages build their indices |
+| Options | None | `stabilize`, `impute`, `order`, `scope`, `weight_var` |
+| Years | ACS5 2017–2022 | ACS5 ≥ 2017 |
+| Geography | Block group | Block group, tract or county |
+| States in `"all"` | 50 + DC + PR | 50 + DC |
+| Variables | 19 (18 in the PCA + `educ_hs_pl_perc`) | The 18 PCA variables |
+| Rate with a zero denominator | 0 | **Missing** (as in the sibling packages) |
+| Margins of error | Always (block group) | Only with `stabilize = TRUE` |
+| Rows removed first | None | Zero population (`tot_pop == 0`); added back unscored |
+| Suppression | `PH` / `GQ` / `GQ-PH`: not scored, labelled | **None**: a CMS-suppressed block group is scored if its data allow |
+| Stabilization | Always; block group → tract | Optional; block group → tract, tract → county, county → state |
+| Rows counted in $n_T$ | All block groups in the tract | Rows with population > 0 |
+| Variables stabilized | All 19 | The 18 |
+| Imputation | **Hierarchical**: tract → county → state value | Optional **spatial**: (population-weighted) mean of queen-contiguity neighbours (`imputeMissing()`) |
+| Order of the two steps | Stabilize, then impute | `"stabilize_first"` or `"impute_first"`; with `impute_first`, imputed cells are not stabilized but enter the tract's $t^2$ |
+| Still missing after imputation | Only if the tract, county and state values are all missing | No score (e.g. island block groups with no neighbours, or without `impute`) |
+| `inc_dis_upd` | log of the ratio; a missing or 0 ratio falls back to the parent | log of the ratio; missing if either income count is 0 |
+| PCA universe | Non-suppressed block groups | Complete cases after the optional steps, nationally or per state (`scope`) |
+| Standardization | Per variable, all available values | Per variable, over the complete cases |
+| Score and rescaling | coefficients = loadings / eigenvalue; `CDI_std` = mean 100 / SD 20 | Same |
+| Ranking | SAS `proc rank groups=100`: $\lfloor r \cdot 100/(n+1) \rfloor + 1$ | `dplyr::ntile(CDI_std, 100)` |
+| Missing score | Rank 1 (CMS SAS quirk, kept) | `NA` |
+| Main output | `CDI_NATRANK` (`"1"`–`"100"` or `GQ` / `PH` / `GQ-PH`), `cdi_rank` | `our_CDI` (1–100), `CDI_std`, `annotation` |
+
+The two methods coincide only if all of these hold at once: zero denominators
+set to 0, no suppression, hierarchical rather than spatial imputation, Puerto
+Rico included, and the same ranking rule. The order of stabilization and
+imputation only matters with spatial imputation. With hierarchical imputation
+the two orders give identical results: imputed cells take a parent value, and
+missing cells add nothing to $t^2$ either way.
+
+### Ranking: SAS `proc rank` vs. `dplyr::ntile()`
+
+Both cut the scores into 100 groups of almost equal size. They differ in two
+ways:
+
+- **Ties.** `proc rank` gives tied scores their average rank, so ties always
+  share a group. `ntile()` breaks ties by row order (`row_number()`), so tied
+  scores can be split across two groups.
+- **Group boundaries.** `proc rank` places each block group with the formula
+  $\lfloor r \cdot k / (n + 1) \rfloor + 1$. `ntile()` makes groups of size
+  $\lfloor n/k \rfloor$ or $\lceil n/k \rceil$ and puts the larger groups
+  first. With the same $n$ the group sizes can match while the boundaries sit
+  in slightly different places.
+
+A toy example with 10 scores in 4 groups. The 30s are tied:
+
+```{r}
+#| label: rank-toy
+score <- c(10, 20, 30, 30, 30, 40, 50, 60, 70, 80)
+tibble::tibble(
+  score,
+  rank_avg     = rank(score),                      # ties -> average rank
+  proc_rank    = rankGroupsSAS(score, groups = 4), # floor(rank * 4 / 11) + 1
+  ntile        = dplyr::ntile(score, 4)
+) |>
+  knitr::kable()
+```
+
+- `proc rank` puts all three 30s in group 2, with group sizes 2 / 3 / 3 / 2.
+- `ntile()` puts one 30 in group 1 and two in group 2, with sizes 3 / 3 / 2 / 2.
+
+At national scale, with no ties, the two rules disagree only near group
+boundaries, and by exactly one group. `ntile()` puts the larger groups first,
+so its boundaries come later and `proc rank` is never lower:
+
+```{r}
+#| label: rank-national
+set.seed(1)
+z <- rnorm(215620)          # about the number of ranked block groups
+d <- rankGroupsSAS(z, 100) - dplyr::ntile(z, 100)
+table(`proc_rank - ntile` = d)
+cat(sprintf("Same group: %.2f%%\n", 100 * mean(d == 0)))
+```
+
+This alone keeps `computeCDI()` from matching every CMS rank exactly, even if
+the scores were identical. It is small next to the differences in the
+universe and in imputation.
+
+Variants of `computeCDI(geo = "block group", year = 2019, states = "all")`:
+
+| Variant | `stabilize` | `impute` | `order` |
+|---|---|---|---|
+| `complete_case` | `FALSE` | `FALSE` | – |
+| `stabilize_only` | `TRUE` | `FALSE` | – |
+| `impute_only` | `FALSE` | `TRUE` | – |
+| `stabilize_first` | `TRUE` | `TRUE` | `"stabilize_first"` |
+| `impute_first` | `TRUE` | `TRUE` | `"impute_first"` |
+
+```{r}
+#| label: variants
+variant_names <- c("complete_case", "stabilize_only", "impute_only",
+                   "stabilize_first", "impute_first")
+
+variants <- purrr::map_dfr(variant_names, function(nm) {
+  rds <- file.path(dev_dir, paste0("cdi_variant_", nm, "_2019.rds"))
+  readRDS(rds) |> dplyr::mutate(variant = nm, .before = 1)
+}) |>
+  dplyr::mutate(variant = factor(variant, levels = variant_names))
+
+# Reference: the CMS method (Part 1 shows it equals the CMS file).
+ref <- orig |>
+  dplyr::select(GEOID, ref_rank = cdi_rank, ref_std = CDI_std,
+                suppression_flag, ref_annotation = annotation)
+
+both <- variants |> dplyr::left_join(ref, by = "GEOID")
+```
+
+## Coverage
+
+Which block groups get a score? `computeCDI()` does not suppress, so it can
+score block groups CMS suppresses; without imputation it drops every block
+group with a missing variable.
+
+```{r}
+#| label: coverage
+both |>
+  dplyr::group_by(variant) |>
+  dplyr::summarise(
+    `block groups`               = dplyr::n(),
+    `scored`                     = sum(!is.na(our_CDI)),
+    `scored, ranked by CMS`      = sum(!is.na(our_CDI) & !is.na(ref_rank)),
+    `not scored, ranked by CMS`  = sum(is.na(our_CDI) & !is.na(ref_rank)),
+    `scored, suppressed by CMS`  = sum(!is.na(our_CDI) & !is.na(suppression_flag)),
+    .groups = "drop"
+  ) |>
+  knitr::kable(format.args = list(big.mark = ","))
+```
+
+## Rank agreement with the CMS method
+
+On block groups ranked by both. Ranks are relative to each method's own set of
+scored block groups, so even identical orderings need not give identical ranks;
+the Spearman correlation measures the ordering alone. The sets differ: without
+imputation `computeCDI()` scores only complete cases; it also scores block
+groups CMS suppresses, and leaves out Puerto Rico, which CMS ranks. A variant can
+therefore order block groups almost exactly like CMS (Spearman near 1) and
+still give many of them a different 1–100 rank.
+
+```{r}
+#| label: agreement
+agree <- both |>
+  dplyr::filter(!is.na(our_CDI), !is.na(ref_rank)) |>
+  dplyr::group_by(variant) |>
+  dplyr::group_modify(~ rank_agreement(.x$our_CDI, .x$ref_rank)) |>
+  dplyr::ungroup()
+
+knitr::kable(agree, digits = 3, format.args = list(big.mark = ","))
+```
+
+```{r}
+#| label: agreement-hex
+#| fig-width: 11
+#| fig-height: 8
+hex_plot(both |> dplyr::filter(!is.na(our_CDI), !is.na(ref_rank)),
+         ref_rank, our_CDI,
+         xlab = "cdi_rank (computeOriginalCDI = CMS)", ylab = "our_CDI (computeCDI)",
+         title = "computeCDI variants vs. the CMS method (2019 ACS5)") +
+  facet_wrap(~ variant, ncol = 3)
+```
+
+## Where do the methods disagree?
+
+Mean absolute rank difference by the `computeCDI()` annotation: block groups
+whose values were imputed or stabilized are where the methods can diverge.
+
+```{r}
+#| label: agreement-by-annotation
+both |>
+  dplyr::filter(!is.na(our_CDI), !is.na(ref_rank)) |>
+  dplyr::group_by(variant, annotation) |>
+  dplyr::summarise(n = dplyr::n(),
+                   mean_abs = mean(abs(our_CDI - ref_rank)),
+                   same_decile_pct = 100 * mean((our_CDI - 1) %/% 10 == (ref_rank - 1) %/% 10),
+                   .groups = "drop") |>
+  knitr::kable(digits = 2, format.args = list(big.mark = ","))
+```
+
+## Does the order matter? `stabilize_first` vs. `impute_first`
+
+Both variants stabilize and impute; only the order differs. The order changes
+the **input values** only in tracts that contain imputed cells (through the
+tract heterogeneity \(t^2\)) and in the imputed cells themselves (averaged from
+stabilized vs. raw neighbors). But the PCA is refit on the changed data, so the
+standardization and the weights move slightly, and almost every block group's
+`CDI_std` changes by a small amount. The rank comparison shows how much that
+matters.
+
+```{r}
+#| label: order-effect
+ord <- both |>
+  dplyr::filter(variant %in% c("stabilize_first", "impute_first")) |>
+  dplyr::select(variant, GEOID, our_CDI, CDI_std) |>
+  tidyr::pivot_wider(names_from = variant, values_from = c(our_CDI, CDI_std)) |>
+  dplyr::filter(!is.na(our_CDI_stabilize_first), !is.na(our_CDI_impute_first))
+
+rank_agreement(ord$our_CDI_stabilize_first, ord$our_CDI_impute_first) |>
+  knitr::kable(digits = 4, format.args = list(big.mark = ","))
+
+cat("Block groups with any change in CDI_std:",
+    format(sum(abs(ord$CDI_std_stabilize_first - ord$CDI_std_impute_first) > 1e-8), big.mark = ","),
+    "of", format(nrow(ord), big.mark = ","), "\n")
+
+table(`our_CDI(stabilize_first) - our_CDI(impute_first)` =
+        cut(ord$our_CDI_stabilize_first - ord$our_CDI_impute_first,
+            c(-Inf, -3, -2, -1, 0, 1, 2, Inf), right = TRUE))
+```
+
+## Session info
+
+```{r}
+#| label: session-info
+#| code-fold: true
+sessionInfo()
+```

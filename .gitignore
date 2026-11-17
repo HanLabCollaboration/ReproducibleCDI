@@ -1,9 +1,14 @@
-.Rproj.user
+# R / RStudio / Positron session files
+.Rproj.user/
 .Rhistory
 .Rapp.history
+.RData
 .Rdata
+.Ruserdata
 .httr-oauth
-.vscode
+.Renviron
+.vscode/
+.positron/
 
 # macOS system files
 .DS_Store
@@ -11,22 +16,34 @@
 .LSOverride
 Icon?
 ._*
-inst/doc
+
+# Built and rendered artifacts
+inst/doc/
+docs/
+*.tar.gz
+*.Rcheck/
+README.html
+*_files/
+
+# Test and coverage output
+tests/testthat/_snaps/**/*.new.md
+tests/testthat/Rplots.pdf
+Rplots.pdf
+
+# Local validation / scratch (R CMD check reports, rendered reports)
+check_report/
+
+# Journal supplementary materials (Robst et al. 2024; not redistributed)
+qxae161_supplementary_data/
+
+# dev/: track the validation scripts, notebooks, plan and summary text;
+# keep data inputs and computed outputs local. CDI_NATRANK.csv comes from
+# github.com/CMSgov/community-deprivation-index.
+dev/*.rds
+dev/*.csv
+dev/*.html
+dev/.here
+dev/.Rapp.history
 
 # Claude project instructions
 CLAUDE.md
-
-# local validation / scratch
-check_report/
-
-# folder with supplementary materials
-qxae161_supplementary_data/
-
-#
-dev/
-# journal supplementary materials (not redistributed)
-qxae161_supplementary_data/
-
-# generated artifacts / cached data
-README.html
-dev/*.rds

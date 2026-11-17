@@ -7,6 +7,10 @@
 processCDIScope(
   CDI_data_sub,
   impute_sub = FALSE,
+  stabilize_sub = FALSE,
+  order_sub = "stabilize_first",
+  CDI_parent = NULL,
+  geo_parent_key_len = NULL,
   quiet_sub = FALSE,
   return_format_sub = "detailed",
   weight_var_sub = "tot_pop"
@@ -16,6 +20,14 @@ processCDIScope(
 \item{CDI_data_sub}{A data frame subset for a single scope (optionally `sf`).}
 
 \item{impute_sub}{Logical, whether to perform spatial imputation.}
+
+\item{stabilize_sub}{Logical, whether to stabilize toward the parent level.}
+
+\item{order_sub}{`"stabilize_first"` or `"impute_first"`.}
+
+\item{CDI_parent}{Parent-level variables (required when `stabilize_sub`).}
+
+\item{geo_parent_key_len}{`GEOID` prefix length of the parent level.}
 
 \item{quiet_sub}{Logical, whether to suppress messages and warnings.}
 
@@ -28,23 +40,37 @@ processCDIScope(
 A list with:
 * `final_data`: full data frame with `CDI`, `CDI_std`, `our_CDI`, annotation.
 * `pca_object`: the `psych::principal` object (or `NULL` if PCA failed).
+* `pca_coefficients`: the sign-aligned scoring coefficients.
 * `data_with_no_imputation`: the raw, non-imputed input for the scope.
-* `data_harmonized`: the standardized component data fed into the PCA.
+* `data_harmonized`: the complete-case data fed into the PCA, with
+  standardized `std_` columns.
+* `data_stabilized`: the [stabilizeCDI()] output with diagnostics (or
+  `NULL`).
 }
 \description{
 Primary internal workhorse for `computeCDI()`. It processes a single "scope"
-(all national data, or the data for a single state) and follows the Singh /
-ADI methodology described in the CDI supplement:
+(all national data, or the data for a single state):
 \enumerate{
   \item filter geographies with no population;
-  \item optionally impute missing data with spatial (queen-contiguity)
-    neighbors, exactly as the sibling Yost/NDI packages do;
-  \item standardize each of the 18 component variables to mean 0, SD 1;
-  \item run a principal component analysis and take the first component's
-    loadings as the factor weights \eqn{W_j};
-  \item form the factor-weighted composite \eqn{S_i = \sum_j X'_{ij} W_j},
-    sign-aligned so that higher scores mean more deprivation;
-  \item rescale the composite to mean 100, SD 20 (`CDI_std`); and
-  \item rank the rescaled score into national percentiles 1-100 (`our_CDI`).
+  \item optionally stabilize (CMS shrinkage toward the parent level, via
+    [stabilizeCDI()]) and/or impute (spatial queen-contiguity, via
+    [imputeMissing()]), in the order given by `order_sub`;
+  \item log-transform the income-disparity ratio;
+  \item on complete cases, standardize the 18 variables, fit a
+    one-component PCA, and score with the scoring coefficients,
+    sign-aligned so higher = more deprived ([fitCDIPCA()]);
+  \item rescale to mean 100, SD 20 (`CDI_std`); and
+  \item rank into percentiles 1-100 (`our_CDI`, `dplyr::ntile()`).
+}
+
+Order of stabilization and imputation (only matters when both are on):
+\itemize{
+  \item `"stabilize_first"`: observed values are stabilized (missing values
+    stay missing and add nothing to the parent heterogeneity), then the
+    remaining gaps are imputed from the stabilized neighbors.
+  \item `"impute_first"`: gaps are imputed from the raw neighbors, then the
+    data are stabilized. Imputed cells have no MOE, so they are not
+    stabilized themselves, but they enter the parent heterogeneity \eqn{t^2}
+    used to stabilize their observed siblings.
 }
 }

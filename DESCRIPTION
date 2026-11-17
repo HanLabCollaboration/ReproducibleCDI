@@ -9,11 +9,15 @@ Description: Provides a simple, tidy interface for calculating the Community
     socioeconomic deprivation, using data from the US Census Bureau's American
     Community Survey (ACS). The CDI follows the Singh/Area Deprivation Index
     (ADI) methodology - a principal-component-weighted composite of 18
-    standardized ACS variables computed natively at the census block group
-    level - and adds a percentage-uninsured variable. Features include
-    automatic data fetching, flexible geographies (county, tract, block group),
-    principal component analysis, hierarchical (block group -> tract -> county)
-    imputation, and rescaling to a 1-100 percentile ranking.
+    standardized ACS variables - and adds a percentage-uninsured variable.
+    The variables match the official CMS reference implementation exactly.
+    computeOriginalCDI() reproduces every CMS step at the block-group level
+    (margin-of-error-based empirical Bayes stabilization toward the tract,
+    hierarchical block group -> tract -> county -> state imputation,
+    group-quarters / low-population suppression, and SAS-style 1-100 ranks).
+    computeCDI() builds the index the way the sibling ReproducibleX packages
+    do, at county, tract, or block-group level, with optional stabilization
+    and spatial imputation in a user-chosen order.
 License: MIT + file LICENSE.md
 Encoding: UTF-8
 URL: https://github.com/HanLabCollaboration/ReproducibleCDI
@@ -34,6 +38,8 @@ Imports:
     stats
 Suggests:
     knitr,
-    rmarkdown
+    rmarkdown,
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
 Depends:
     R (>= 4.1.0)

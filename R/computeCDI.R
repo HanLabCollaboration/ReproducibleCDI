@@ -2,28 +2,41 @@
 #'
 #' @description
 #' Fetches and processes ACS data to calculate the Community Deprivation Index
-#' (CDI), a composite measure of neighborhood-level socioeconomic deprivation.
+#' (CDI), a composite measure of neighborhood-level socioeconomic deprivation,
+#' following the conventions of the sibling ReproducibleX packages
+#' (ReproducibleYostIndex, ReproducibleNDI, ReproducibleSDI).
 #'
-#' The CDI follows the Singh / Area Deprivation Index (ADI) methodology and adds
-#' a percentage-uninsured variable, for a total of 18 standardized ACS
-#' variables. The function automates: 1) data fetching from `tidycensus`,
-#' 2) calculation of the 18 component variables, 3) optional spatial imputation,
-#' 4) a principal component analysis whose first-component loadings provide the
-#' factor weights, 5) construction of the factor-weighted composite, 6)
-#' rescaling to mean 100 / SD 20, and 7) ranking into national percentiles 1-100.
+#' The variables are exactly the 18 used by the official CMS reference
+#' implementation (CMSgov/community-deprivation-index). The function automates:
+#' 1) data fetching from `tidycensus`, 2) calculation of the variables (a rate
+#' with a zero denominator is missing, as in the sibling packages), 3) optional
+#' CMS stabilization and/or spatial imputation, in the order you choose, 4) a
+#' one-component principal component analysis whose scoring coefficients give
+#' the factor-weighted composite, 5) rescaling to mean 100 / SD 20, and 6)
+#' ranking into percentiles 1-100.
 #'
-#' The CDI is designed to be computed natively at the **census block group**
-#' level; every component variable is drawn from a detailed (`B`/`C`) ACS table
-#' so that block-group tabulation is available.
+#' To reproduce every CMS step exactly (hierarchical imputation, suppression,
+#' SAS ranking), use [computeOriginalCDI()] instead.
 #'
 #' @param geo The geography level. One of `"county"`, `"tract"`,
 #'   `"block group"` (or `"cbg"`). The CDI is conventionally a block-group index.
-#' @param year The 5-year ACS survey end year (e.g., 2022). Must be >= 2016
-#'   because the household-internet variable (B28002) is not published earlier.
+#' @param year The 5-year ACS survey end year (e.g., 2022). Must be >= 2017
+#'   because the household-internet table B28002 is not published earlier.
 #' @param states A vector of state abbreviations (e.g., `c("CA", "NY")`) or
 #'   `"all"` for the entire US.
+#' @param stabilize Logical. If `TRUE`, applies the CMS MOE-based empirical
+#'   Bayes stabilization ([stabilizeCDI()]) toward the parent level: block group
+#'   toward tract (as CMS), tract toward county, or county toward state (as in
+#'   ReproducibleYostIndex). Only observed values with a margin of error are
+#'   stabilized.
 #' @param impute Logical. If `TRUE`, performs spatial (queen-contiguity) mean
-#'   imputation for missing data, as in the sibling Yost/NDI packages.
+#'   imputation of missing data ([imputeMissing()]), as in the sibling packages.
+#' @param order Order of the two steps when both `stabilize` and `impute` are
+#'   `TRUE`: `"stabilize_first"` (default) stabilizes the observed values and
+#'   then imputes the remaining gaps from the stabilized neighbors;
+#'   `"impute_first"` imputes from the raw neighbors and then stabilizes
+#'   (imputed cells are not stabilized themselves, but they enter the parent
+#'   heterogeneity used to stabilize the observed cells).
 #' @param quiet Logical. If `TRUE`, suppresses messages and warnings.
 #' @param return_format `"detailed"` (default) or `"minimal"`. `"minimal"`
 #'   returns only `GEOID`, `CDI_std`, `our_CDI`, and `annotation`.
@@ -38,13 +51,19 @@
 #' If `return_format = "minimal"`, a data frame of `GEOID`, `CDI_std`,
 #' `our_CDI`, and `annotation`. Otherwise a list with:
 #' \itemize{
-#'   \item `df_cdi`: primary data frame with the component variables, the raw
-#'     composite `CDI`, the rescaled `CDI_std` (mean 100 / SD 20), the national
-#'     percentile `our_CDI` (1-100), and `annotation`.
-#'   \item `data_harmonized`: the standardized component data fed into the PCA.
-#'   \item `data_without_imputation`: the raw, non-imputed component data.
+#'   \item `df_cdi`: primary data frame with the component variables (after
+#'     stabilization / imputation), the raw composite `CDI`, the rescaled
+#'     `CDI_std` (mean 100 / SD 20), the percentile `our_CDI` (1-100),
+#'     `nvar_stabilized`, `nvar_imputed`, and `annotation`. With
+#'     `stabilize = TRUE` it also has `<var>_raw`, `<var>_raw_moe`, and
+#'     `stabilizedflg_<var>` (the `inc_dis_upd` MOE is on the ratio scale).
+#'   \item `data_harmonized`: the complete-case data fed into the PCA.
+#'   \item `data_without_imputation`: the raw component data.
+#'   \item `data_stabilized`: the [stabilizeCDI()] output with diagnostics
+#'     (`NULL` unless `stabilize = TRUE`).
 #'   \item `obj_pca`: the `psych::principal` object (or a named list of objects
 #'     when `scope = "state"`).
+#'   \item `settings`: the method choices used.
 #' }
 #'
 #' @references
@@ -68,7 +87,9 @@ computeCDI <- function(
     geo,
     year,
     states,
+    stabilize = FALSE,
     impute = FALSE,
+    order = c("stabilize_first", "impute_first"),
     quiet = FALSE,
     return_format = "detailed",
     scope = "national",
@@ -77,61 +98,71 @@ computeCDI <- function(
 
   # --- 1. Argument checks ----------------------------------------------------
   geo <- rlang::arg_match(geo, values = c("county", "tract", "block group", "cbg"))
+  if (geo == "cbg") geo <- "block group"
+  order <- rlang::arg_match(order, values = c("stabilize_first", "impute_first"))
   return_format <- rlang::arg_match(return_format, values = c("minimal", "detailed"))
   scope <- rlang::arg_match(scope, values = c("national", "state"))
   weight_var <- rlang::arg_match(weight_var, values = c("tot_pop", "none"))
-  stopifnot(is.numeric(year), year >= 2016)
-
-  get_geometry <- impute
-
-  # Validate / expand the requested states.
-  all_geos <- unique(tidycensus::fips_codes$state)
-  non_states <- c("PR", "AS", "GU", "MP", "VI", "UM")
-  valid_states <- setdiff(all_geos, non_states)
-
-  if (states[1] == "all") {
-    states <- valid_states
-  } else {
-    invalid_states <- setdiff(states, valid_states)
-    if (length(invalid_states) > 0) {
-      invalid_states_str <- glue::glue_collapse(invalid_states, sep = ", ")
-      stop(glue::glue(
-        "Invalid state abbreviations provided: {invalid_states_str}.
-         Please use standard 2-letter postal codes for the 50 US states."
-      ))
-    }
+  stopifnot(is.logical(stabilize), length(stabilize) == 1, !is.na(stabilize))
+  stopifnot(is.logical(impute), length(impute) == 1, !is.na(impute))
+  if (!is.numeric(year) || length(year) != 1 || is.na(year) || year < 2017) {
+    stop("`year` must be an ACS5 end year >= 2017: table B28002 (household internet), ",
+         "one of the 18 CDI variables, is not published before ACS5 2017.", call. = FALSE)
   }
+
+  states <- resolveCDIStates(states)
 
   # --- 2. Data fetching and processing ---------------------------------------
   if (!quiet) message("Fetching raw ACS data...")
 
-  CDI_data_raw <- fetchCDIAcs(geo, year, states, get_geometry)
-  acs_vars <- attr(CDI_data_raw, "acs_vars")
-
-  CDI_data_clean <- cleanAcsNamesCDI(dframe = CDI_data_raw, geo = geo)
+  CDI_data_raw <- fetchCDIAcs(geo, year, states, get_geometry = impute, moe = stabilize)
+  checkCDIAvailability(CDI_data_raw, geo, year)
 
   if (!quiet) message("Calculating CDI component variables...")
-  CDI_data <- CDI_data_clean |>
-    calculateCDIVars(acs_vars = acs_vars)
+  CDI_data <- cleanAcsNamesCDI(dframe = CDI_data_raw, geo = geo) |>
+    calculateCDIVars(zero_denominator = "na", with_moe = stabilize)
+
+  CDI_parent <- NULL
+  geo_parent_key_len <- NULL
+  if (stabilize) {
+    geo_hierarchy <- list(
+      "block group" = list(parent = "tract",  key_len = 11),
+      "tract"       = list(parent = "county", key_len = 5),
+      "county"      = list(parent = "state",  key_len = 2)
+    )
+    geo_parent <- geo_hierarchy[[geo]]$parent
+    geo_parent_key_len <- geo_hierarchy[[geo]]$key_len
+    if (!quiet) message(glue::glue("Fetching {geo_parent}-level data for stabilization..."))
+    CDI_parent <- fetchCDIAcs(geo_parent, year, states) |>
+      calculateCDIVars(zero_denominator = "na")
+  }
+
+  run_scope <- function(data_sub) {
+    processCDIScope(
+      CDI_data_sub = data_sub,
+      impute_sub = impute,
+      stabilize_sub = stabilize,
+      order_sub = order,
+      CDI_parent = CDI_parent,
+      geo_parent_key_len = geo_parent_key_len,
+      quiet_sub = quiet,
+      return_format_sub = return_format,
+      weight_var_sub = weight_var
+    )
+  }
 
   # --- 3. Main branching logic -----------------------------------------------
   if (scope == "state" && length(states) > 1) {
     if (!quiet) message("Scope is 'state'. Processing each state separately.")
 
     list_of_state_data <- dplyr::group_split(CDI_data, state)
-
-    results_list <- purrr::map(list_of_state_data, ~processCDIScope(
-      CDI_data_sub = .x,
-      impute_sub = impute,
-      quiet_sub = quiet,
-      return_format_sub = return_format,
-      weight_var_sub = weight_var
-    ))
+    results_list <- purrr::map(list_of_state_data, run_scope)
 
     results_list <- purrr::keep(results_list, ~ !is.null(.x))
     CDI_output_data <- purrr::map_dfr(results_list, "final_data")
     data_harmonized <- purrr::map_dfr(results_list, "data_harmonized")
     data_without_imputation <- purrr::map_dfr(results_list, "data_with_no_imputation")
+    data_stabilized <- if (stabilize) purrr::map_dfr(results_list, "data_stabilized") else NULL
     list_of_pca_objects <- purrr::map(results_list, "pca_object")
 
     names(list_of_pca_objects) <- purrr::map_chr(results_list, ~ unique(.x$final_data$state)[1])
@@ -140,17 +171,12 @@ computeCDI <- function(
   } else {
     if (!quiet) message("Scope is 'national' or only one state selected. Processing all geographies together.")
 
-    single_result <- processCDIScope(
-      CDI_data_sub = CDI_data,
-      impute_sub = impute,
-      quiet_sub = quiet,
-      return_format_sub = return_format,
-      weight_var_sub = weight_var
-    )
+    single_result <- run_scope(CDI_data)
 
     CDI_output_data <- single_result$final_data
     data_harmonized <- single_result$data_harmonized
     data_without_imputation <- single_result$data_with_no_imputation
+    data_stabilized <- single_result$data_stabilized
     out_obj_pca <- single_result$pca_object
   }
 
@@ -167,7 +193,13 @@ computeCDI <- function(
   out$df_cdi <- CDI_output_data |> dplyr::arrange(GEOID)
   out$data_harmonized <- data_harmonized
   out$data_without_imputation <- data_without_imputation
+  out$data_stabilized <- data_stabilized
   out$obj_pca <- out_obj_pca
+  out$settings <- list(
+    geo = geo, year = year, stabilize = stabilize, impute = impute,
+    order = if (stabilize && impute) order else NA_character_,
+    scope = scope, weight_var = weight_var
+  )
 
   return(out)
 }
